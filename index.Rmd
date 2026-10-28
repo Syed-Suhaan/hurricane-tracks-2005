@@ -1,0 +1,194 @@
+---
+pagetitle: "Twenty-four tracks: the 2005 Atlantic hurricane season"
+date: "`r format(Sys.Date(), '%Y-%m-%d')`"
+output:
+  html_document:
+    theme: null
+    highlight: null
+    mathjax: null
+    css: styles.css
+    self_contained: false
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+library(leaflet)
+library(sf)
+library(dplyr)
+
+# Saffir-Simpson classes from peak sustained wind in knots (MaxWind)
+cat_levels <- c("Depression", "Tropical storm", paste("Category", 1:5))
+cat_cols   <- c("#8fa3bd", "#5ebaff", "#ffe775", "#ffc140", "#ff8f20", "#ff5a36", "#ff2d95")
+cat_breaks <- c(-Inf, 34, 64, 83, 96, 113, 137, Inf)
+cat_ranges <- c("below 34 kt", "34–63 kt", "64–82 kt", "83–95 kt",
+                "96–112 kt", "113–136 kt", "137 kt or more")
+names(cat_cols) <- cat_levels
+
+storms <- st_as_sf(atlStorms2005) |>
+  mutate(
+    Name = tools::toTitleCase(tolower(Name)),
+    kt   = MaxWind,
+    mph  = round(kt * 1.15078),
+    kmh  = round(kt * 1.852),
+    cat  = cut(kt, cat_breaks, right = FALSE, labels = cat_levels),
+    col  = unname(cat_cols[as.character(cat)])
+  ) |>
+  arrange(kt)                       # weakest first, so strong tracks draw on top
+
+start <- do.call(rbind, lapply(st_geometry(storms), function(g) st_coordinates(g)[1, 1:2]))
+storms$lon0 <- start[, 1]
+storms$lat0 <- start[, 2]
+
+storms <- storms |>
+  mutate(
+    label = sprintf("<b>%s</b> &middot; %s &middot; %d kt", Name, cat, kt),
+    popup = sprintf(
+      "<div class='pop'><b>%s</b><br><span style='color:%s'>&#9679;</span> Peak: %s<br>Wind: %d kt (%d mph, %d km/h)<br>Pressure: %d mb</div>",
+      Name, col, cat, kt, mph, kmh, MinPress)
+  )
+
+# ---- numbers quoted in the text, all computed from the data ----
+n_storms <- nrow(storms)
+c5       <- storms |> filter(cat == "Category 5")
+n_c5     <- nrow(c5)
+c5_names <- c5$Name[order(c5$Name)]
+top      <- storms |> slice_max(kt, n = 1)
+low      <- storms |> slice_min(MinPress, n = 1)
+bb       <- st_bbox(storms)
+greek    <- storms$Name[storms$Name %in% c("Alpha", "Beta", "Gamma", "Delta", "Epsilon", "Zeta")]
+
+n_words <- c("no", "one", "two", "three", "four", "five", "six", "seven", "eight")
+
+join_names <- function(x) paste(c(paste(head(x, -1), collapse = ", "), tail(x, 1)), collapse = " and ")
+
+# the text says every Category 5 track crosses the Caribbean / Gulf box; fail the build if not
+carib_gulf <- st_as_sfc(st_bbox(c(xmin = -100, ymin = 10, xmax = -60, ymax = 32), crs = st_crs(storms)))
+stopifnot(all(lengths(st_intersects(c5, carib_gulf)) > 0))
+
+# Katrina's Louisiana landfall (Buras-Triumph); the data's track passes within a few km of it
+landfall <- c(lng = -89.54, lat = 29.35)
+```
+
+<header class="hero">
+<p class="kicker">Created `r format(Sys.Date(), "%B %d, %Y")` &middot; R Markdown + Leaflet</p>
+<h1>Twenty-four tracks.<br><span>One very busy year.</span></h1>
+<p class="lede">In 2005 the Atlantic produced so many storms that forecasters ran out of names
+and, for the first time, switched to the Greek alphabet. This map follows `r n_storms` of
+them, coloured by how intense they got.</p>
+</header>
+
+<div class="stats">
+<div class="stat"><div class="n">`r n_storms`</div><div class="l">storm tracks on the map</div></div>
+<div class="stat"><div class="n">`r n_c5`</div><div class="l">reached Category 5: `r join_names(c5_names)`</div></div>
+<div class="stat"><div class="n">`r top$kt` <small>kt</small></div><div class="l">strongest winds, `r top$Name` (`r top$mph` mph)</div></div>
+<div class="stat"><div class="n">`r low$MinPress` <small>mb</small></div><div class="l">lowest pressure, `r low$Name`</div></div>
+</div>
+
+::: {.map-wrap}
+```{r map}
+# Esri basemaps: CARTO's free raster tiles now return an "API key required" placeholder
+esri  <- "https://server.arcgisonline.com/ArcGIS/rest/services/%s/MapServer/tile/{z}/{y}/{x}"
+esri_attr <- "Tiles &copy; Esri &mdash; Esri, DeLorme, NAVTEQ, USGS, NOAA"
+night_base <- sprintf(esri, "Canvas/World_Dark_Gray_Base")
+
+m <- leaflet(width = "100%", height = "76vh",
+             options = leafletOptions(minZoom = 2, zoomSnap = 0.25, zoomDelta = 0.5)) |>
+  addTiles(night_base, group = "Night", attribution = esri_attr,
+           options = tileOptions(maxNativeZoom = 16)) |>
+  addTiles(sprintf(esri, "Canvas/World_Dark_Gray_Reference"), group = "Night",
+           options = tileOptions(maxNativeZoom = 16)) |>
+  addTiles(sprintf(esri, "World_Imagery"), group = "Satellite", attribution = esri_attr) |>
+  fitBounds(-98, 9, -8, 52)
+
+# each layer group is a glow (wide, faint) under a crisp line, weakest groups first
+groups <- list(
+  "Tropical storms & depressions" = c("Depression", "Tropical storm"),
+  "Category 1–2"             = c("Category 1", "Category 2"),
+  "Category 3–4"             = c("Category 3", "Category 4"),
+  "Category 5"                    = "Category 5"
+)
+
+for (g in names(groups)) {
+  d <- filter(storms, cat %in% groups[[g]])
+  m <- m |>
+    addPolylines(data = d, color = ~col, weight = ~ 7.5 + kt / 55, opacity = 0.16,
+                 options = pathOptions(interactive = FALSE), group = g) |>
+    addPolylines(data = d, color = ~col, weight = ~ 1.5 + kt / 55, opacity = 0.95,
+                 label = ~lapply(label, htmltools::HTML), popup = ~popup,
+                 highlightOptions = highlightOptions(weight = 7, opacity = 1, bringToFront = TRUE),
+                 group = g) |>
+    addCircleMarkers(data = d, lng = ~lon0, lat = ~lat0, radius = 3, weight = 1,
+                     color = "#ffffff", fillColor = ~col, fillOpacity = 1,
+                     label = ~paste0(Name, " · first recorded position"), group = g)
+}
+
+m |>
+  addLabelOnlyMarkers(data = c5, lng = ~lon0, lat = ~lat0, label = ~toupper(Name),
+                      labelOptions = labelOptions(noHide = TRUE, direction = "top", offset = c(0, -4),
+                                                  className = "storm-label"),
+                      group = "Category 5") |>
+  addCircleMarkers(lng = landfall[["lng"]], lat = landfall[["lat"]], radius = 11, weight = 2,
+                   color = "#ffffff", fill = FALSE, group = "Category 5",
+                   label = "Katrina's Louisiana landfall, Aug 29 2005 (Category 3 at landfall)",
+                   labelOptions = labelOptions(direction = "right", offset = c(12, 0))) |>
+  addLayersControl(baseGroups = c("Night", "Satellite"), overlayGroups = names(groups),
+                   options = layersControlOptions(collapsed = FALSE), position = "topright") |>
+  addLegend(position = "bottomleft", colors = unname(cat_cols),
+            labels = paste0(cat_levels, " <span style='color:#777'>(", cat_ranges, ")</span>"),
+            title = "Peak intensity", opacity = 0.92) |>
+  addScaleBar(position = "bottomleft", options = scaleBarOptions(imperial = FALSE)) |>
+  addMeasure(position = "topleft", primaryLengthUnit = "kilometers", primaryAreaUnit = "sqkilometers",
+             activeColor = "#ff8f20", completedColor = "#ff2d95") |>
+  addMiniMap(tiles = night_base, toggleDisplay = TRUE, minimized = TRUE,
+             position = "bottomright") |>
+  addEasyButton(easyButton(icon = "fa-globe", title = "Whole Atlantic",
+                           onClick = JS("function(btn, map){ map.fitBounds([[9,-98],[52,-8]]); }"))) |>
+  addEasyButton(easyButton(icon = "fa-crosshairs", title = "Gulf of Mexico",
+                           onClick = JS("function(btn, map){ map.fitBounds([[17,-98],[31,-78]]); }")))
+```
+:::
+
+<p class="hint"><b>Try it:</b> click a track for its details, hover to highlight it, switch the basemap or hide
+intensity classes (top right), measure a distance with the ruler (top left), and use the globe and crosshair
+buttons to jump between the whole Atlantic and the Gulf of Mexico.</p>
+
+<div class="prose">
+
+## How to read it
+
+- **Colour is peak intensity** on the Saffir&ndash;Simpson scale, worked out from each storm's maximum
+  sustained wind (`MaxWind`, in knots). Lines also get thicker as the wind gets stronger.
+- **The white-rimmed dot** marks the first recorded position of each track.
+- **The white ring** in Louisiana marks where Katrina came ashore. Its track in the data passes within
+  about six kilometres of that spot.
+
+## Things to look for
+
+- **The Gulf and the Caribbean are the hot zone.** The `r n_words[n_c5 + 1]` Category 5 storms
+  (`r join_names(c5_names)`) all cut through the Caribbean or the Gulf of Mexico.
+- **The alphabet ran out.** `r join_names(greek)` are the names storms got after the 21 on the
+  official list had been used up.
+- **Some tracks keep going.** The northernmost point reaches `r round(bb[["ymax"]], 1)`&deg;N, far
+  beyond the tropics.
+
+<details>
+<summary>Table view: all `r n_storms` storms, strongest first</summary>
+
+```{r table}
+storms |>
+  st_drop_geometry() |>
+  arrange(desc(kt), MinPress) |>
+  transmute(Storm = Name, `Peak intensity` = as.character(cat),
+            `Wind (kt)` = kt, `Wind (mph)` = mph, `Pressure (mb)` = MinPress) |>
+  knitr::kable()
+```
+
+</details>
+
+</div>
+
+<footer>
+Created `r format(Sys.Date(), "%A, %B %d, %Y")` with R `r getRversion()` and leaflet
+`r as.character(packageVersion("leaflet"))`. Data: <code>atlStorms2005</code>, bundled with the leaflet
+R package. Basemaps &copy; Esri (credits also shown on the map).
+</footer>
